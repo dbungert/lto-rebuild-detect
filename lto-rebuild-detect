@@ -1,0 +1,170 @@
+#!/usr/bin/python3
+
+# accept an input file which is the output from `apt-file search`
+# that search should highlight files of interest that need checked for lto
+# version mismatch
+# sample query:
+#   apt-file search -x '\.a$' | grep -- -dev:
+# this will have the format:
+# angelscript-dev: /usr/lib/x86_64-linux-gnu/libangelscript-addon.a
+
+from pathlib import Path
+from enum import Enum, auto
+import argparse
+import tempfile
+import shutil
+import os
+import re
+import subprocess
+import contextlib
+import sys
+import glob
+import rich
+
+from ubuntutools.pullpkg import PullPkg
+
+series = 'kinetic'
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--log', help='log file of packages to analyze')
+    parser.add_argument('packages', nargs='*')
+    return parser.parse_args()
+
+
+@contextlib.contextmanager
+def chdir(dest):
+    curdir = os.getcwd()
+    try:
+        os.chdir(dest)
+        yield
+    finally:
+        os.chdir(curdir)
+
+
+def run(cmd, **kwargs):
+    print(cmd)
+    check = kwargs.pop('check', True)
+    return subprocess.run(cmd, check=check, capture_output=True, **kwargs)
+
+
+def mkdir(dest):
+    os.makedirs(dest, exist_ok=True)
+
+
+def pull(package):
+    ppkg = PullPkg()
+    args = (
+        '--pull', 'debs',
+        '-D', 'ubuntu',
+        package, series
+    )
+    try:
+        ppkg.pull(args=args)
+    except re.error as err:
+        print(err)
+        return False
+    return True
+
+
+lto_version_mismatch = re.compile(
+    'fatal error: bytecode stream in file.* generated with LTO version.*' \
+    'instead of the expected',
+    re.MULTILINE)
+
+class Result(Enum):
+    PASS = auto()
+    DOWNLOAD_FAIL = auto()
+    DEB_EXTRACT_FAIL = auto()
+    AR_EXTRACT_FAIL = auto()
+    LTO_VERSION_FAIL = auto()
+    LTO_UKNOWN_FAIL = auto()
+
+
+def result(rv, debs):
+    return {
+        'result': rv.name,
+        'debs': debs,
+    }
+
+
+def analyze_package(package):
+    print(f'Analyzing {package}')
+    mkdir(package)
+    with chdir(package):
+        debs = glob.glob(f'{package}*.deb')
+        if debs:
+            print(f'Using locally cached {debs}')
+        else:
+            print(f'Downloading {package}')
+            if not pull(package):
+                print(f'Skip downloading {package}, pull package failed')
+                return result(Result.DOWNLOAD_FAIL, [])
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            debs = glob.glob(f'{package}*.deb')
+            for deb in debs:
+                try:
+                    run(['sh', '-c', f'dpkg-deb -x {deb} {tempdir}'])
+                except subprocess.CalledProcessError:
+                    print(f'Package {deb} failed to extract')
+                    return result(Result.DEB_EXTRACT_FAIL, debs)
+
+            for num, file in enumerate(Path(tempdir).rglob('*.a')):
+                filename = str(file)
+                archive_dir = f'{tempdir}/archive-{num}'
+                mkdir(archive_dir)
+                try:
+                    run([ar, 'x', filename, '--output', archive_dir])
+                except subprocess.CalledProcessError:
+                    print(f'Unknown problem with ar on file {filename}')
+                    # FIXME reanalyze these
+                    continue
+                if not glob.glob(f'{archive_dir}/*.o'):
+                    print(f'Archive {filename} contains no objects')
+                    continue
+
+                cmd = ['sh', '-c', f'{ltodump} {archive_dir}/*.o']
+                proc = run(cmd, check=False)
+                if proc.returncode != 0:
+                    stderr = proc.stderr.decode()
+                    print(stderr, end='')
+                    if lto_version_mismatch.search(stderr):
+                        print(f'Package {package} Failed lto check')
+                        return result(Result.LTO_VERSION_FAIL, debs)
+                    else:
+                        print(f'Unknown lto check error in {package}')
+                        return result(Result.LTO_UKNOWN_FAIL, debs)
+    print(f'Package {package} Passed lto check')
+    return result(Result.PASS, debs)
+
+
+if __name__ == "__main__":
+    args = get_args()
+    packages = set()
+
+    if args.log:
+        with open(args.log, 'r') as fp:
+            lines = fp.readlines()
+        for line in lines:
+            package, _ = line.strip().split(': ')
+            packages.add(package)
+
+    packages.update(args.packages)
+
+    print(f'Packages to analyze: {len(packages)}')
+
+    gcc = os.path.realpath(shutil.which('gcc'))
+    gccver = re.search(f'-(\d+)$', gcc).group(1)
+    ltodump = f'lto-dump-{gccver}'
+    ar = f'gcc-ar-{gccver}'
+
+    status = {}
+
+    base = 'workdir'
+    mkdir(base)
+    with chdir(base):
+        for package in packages:
+            status[package] = analyze_package(package)
+
+    rich.print(status)
